@@ -21,11 +21,37 @@ from monai.transforms import (
 from monai.data import DataLoader, Dataset
 from typing import List
 from sklearn.model_selection import KFold
+import requests
+import zipfile
 
-data_dir = "./ISLES-2022"
+
+def download_data(url: str, destination_path: str):
+    response = requests.get(url, stream=True)
+    with open(destination_path, 'wb') as file:
+        for chunk in response.iter_content(chunk_size=8192): 
+            file.write(chunk)
+            
+def unzip(zip_path: str, destination_path: str):
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(destination_path)
+
+
+file_url = 'https://zenodo.org/record/7960856/files/ISLES-2022.zip'
+zip_path = '.\data\ISLES-2022.zip'
+data_dir = "./data/ISLES-2022"
+
+# download datset from zenodo
+if not os.path.exists('.\data'):
+    os.mkdir('.\data')
+if not os.path.exists(zip_path):
+    download_data(file_url, zip_path)
+if not os.path.exists(data_dir):
+    unzip(zip_path, '.\data')
+
 dwi_filepath_template = os.path.join(data_dir, "{filename}", "ses-0001", "dwi", "*dwi.nii.gz")
 seg_filepath_template = os.path.join(data_dir, "derivatives", "{filename}", "ses-0001", "*msk.nii.gz")
 target_size=(128, 128)
+
 
 train_transforms = Compose(
     [
@@ -46,6 +72,8 @@ val_transforms = Compose(
         ToTensord(keys=["image", "label"], dtype=torch.float32),
     ]
 )
+
+
 
 def load_image(filepath: str) -> FileBasedImage:
     file = glob.glob(filepath)[0]
@@ -89,7 +117,9 @@ def create_dataset(images, labels):
         })
 
     random.shuffle(data)
-    return data
+    # train = data[:int(0.8 * len(data))]
+    # test = data[int(0.8 * len(data)):]
+    return data    # train, test
 
 def load_segmentation_images(filenames):
     filepath_template = os.path.join(data_dir, "derivatives", "{filename}", "ses-0001", "*msk.nii.gz")
@@ -128,8 +158,10 @@ def kfold_split(dataset):
 
     return folds
 
+
 filenames = get_stroke_filenames()
 dwi_2d_images = load_dwi_images(filenames)
 seg_2d_images = load_segmentation_images(filenames)
 dataset = create_dataset(dwi_2d_images, seg_2d_images)
 folds = kfold_split(dataset)
+
