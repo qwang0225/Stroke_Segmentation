@@ -20,9 +20,9 @@ from monai.transforms import (
 )
 from monai.data import DataLoader, Dataset
 from typing import List
-from sklearn.model_selection import KFold
 import requests
 import zipfile
+import pickle
 
 
 def download_data(url: str, destination_path: str):
@@ -53,6 +53,9 @@ seg_filepath_template = os.path.join(data_dir, "derivatives", "{filename}", "ses
 target_size=(128, 128)
 
 
+# set random seed
+set_determinism(seed=0)
+
 train_transforms = Compose(
     [
         RandAffined(
@@ -72,7 +75,6 @@ val_transforms = Compose(
         ToTensord(keys=["image", "label"], dtype=torch.float32),
     ]
 )
-
 
 
 def load_image(filepath: str) -> FileBasedImage:
@@ -117,9 +119,9 @@ def create_dataset(images, labels):
         })
 
     random.shuffle(data)
-    # train = data[:int(0.8 * len(data))]
-    # test = data[int(0.8 * len(data)):]
-    return data    # train, test
+    train = data[:int(0.8 * len(data))]
+    test = data[int(0.8 * len(data)):]
+    return train, test
 
 def load_segmentation_images(filenames):
     filepath_template = os.path.join(data_dir, "derivatives", "{filename}", "ses-0001", "*msk.nii.gz")
@@ -162,6 +164,13 @@ def kfold_split(dataset):
 filenames = get_stroke_filenames()
 dwi_2d_images = load_dwi_images(filenames)
 seg_2d_images = load_segmentation_images(filenames)
-dataset = create_dataset(dwi_2d_images, seg_2d_images)
-folds = kfold_split(dataset)
+train, test = create_dataset(dwi_2d_images, seg_2d_images)
+folds = kfold_split(train) 
+test_set = Dataset(data=test, transform=val_transforms)
 
+
+# with open('kfold_splits.pkl', 'wb') as f:
+#     pickle.dump(folds, f)
+    
+# with open('test_set.pkl', 'wb') as f:
+#     pickle.dump(test_set, f)
