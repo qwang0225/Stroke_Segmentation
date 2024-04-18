@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 from typing import List
 from torchvision.models.vision_transformer import EncoderBlock
 
@@ -78,9 +79,9 @@ class PatchMerging(nn.Module):
         return self.norm(x)
 
 # wrapper around MultiHeadAttention so we don't have to code the reshapes every time
-class AttentionBlock(nn.Module):
+class EncoderAttentionBlock(nn.Module):
     def __init__(self, channels: int, num_heads: int, dropout: float):
-        super(AttentionBlock, self).__init__()
+        super(EncoderAttentionBlock, self).__init__()
         
         self.attention = nn.MultiheadAttention(
             embed_dim=channels,
@@ -150,7 +151,7 @@ class MLPBlock(nn.Module):
         # x = (B, C, H, W)
 
         x = self.depth_wise(x)
-        # x = (B, C*scale, H, W)
+        # x = (B, C*scale, H, W), hidden_size = C*scale
 
         x = self.nonlinear(x)
 
@@ -165,7 +166,7 @@ class EncoderBlock(nn.Module):
         super(EncoderBlock, self).__init__()
         self.blocks = nn.ModuleList([
             nn.ModuleDict({
-                "self-attention": AttentionBlock(
+                "self-attention": EncoderAttentionBlock(
                     channels=channels,
                     num_heads=num_heads,
                     dropout=dropout
@@ -235,7 +236,7 @@ class Encoder(nn.Module):
             # x = (B, C', H', C')
 
             x = x + layer["transformers"](x)
-
+            
             skip.append(x)
 
         return skip
@@ -251,6 +252,9 @@ class Upsample(nn.Module):
             out_channels=out_channels,
             kernel_size=1
         )
+        
+        # self.convup = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=scale, stride=scale)
+        
 
         self.norm = Normalize(out_channels)
 
@@ -258,10 +262,12 @@ class Upsample(nn.Module):
         # x = (B, C, H, W)
 
         x = self.up(x)
-        # x = (B, C, H//scale, W//scale)
+        # x = (B, C, H*scale, W*scale)
 
         x = self.conv(x)
-        # x = (B, C', H//scale, W//scale)
+        # x = (B, C', H*scale, W*scale)
+        
+        # x=self.convup(x)
         
         x = self.norm(x)
 
@@ -280,7 +286,7 @@ class Concat(nn.Module):
         self.norm = Normalize(channels)
 
     def forward(self, skip):
-        # skip is a list of length num_skip of tensors (B, C, H, W)
+        # skip is a list of tensors (B, C, H, W), with list length num_skip 
 
         x = torch.concat(skip, 1)
         # x = (B, C*num_skip, H, W)
@@ -293,11 +299,57 @@ class Concat(nn.Module):
 
         return x
 
-# for some reason, in my tests, whenever I add AttentionBlock anywhere in the decoder,
-# the model stops learning and I don't know why
-# not just encoder-decoder attention, but self-attention too
+
+class AttentionGate(nn.Module):
+    """
+    Attention gate for U-Net, inspired by https://arxiv.org/pdf/1804.03999.pdf
+    """
+    def __init__(self, dim_g: int, dim_x: int, dim_int: int):
+        """
+        dim_x: number of channels in x, the input tensor from the skip connection
+        dim_g: number of channels in g, the tensor from the last layer of the decoder, which is resized to the same size as x
+        dim_int: number of channels in the intermediate tensor
+        g provides gating signal to control the flow of information from x to decoder
+        """
+        super().__init__()
+        
+        self.w_x = nn.Sequential(
+                                nn.Conv2d(dim_x, dim_int,
+                                         kernel_size=1),
+                                nn.BatchNorm2d(dim_int)
+        )
+        
+        self.w_g = nn.Sequential(
+                                nn.Conv2d(dim_g, dim_int,
+                                         kernel_size=1),
+                                nn.BatchNorm2d(dim_int)
+        )
+        
+        self.psi = nn.Sequential(
+                                nn.Conv2d(dim_int, 1,
+                                         kernel_size=1),
+                                nn.BatchNorm2d(1),
+                                nn.Sigmoid(),
+        )
+        
+        self.relu = nn.ReLU()
+        
+    def forward(self, g, x):
+        g1 = self.w_g(g)
+        x1 = self.w_x(x)
+        psi = self.relu(g1+x1)
+        psi = self.psi(psi) # (B, 1, H, W), gating signal
+        out = x*psi
+        
+        return out 
+    
 class Decoder(nn.Module):
-    def __init__(self, channels: List[int], hidden_size: int):
+    def __init__(self, channels: List[int], hidden_size: int, attention: bool = False):
+        """
+        channels: list of channels for each layer of the encoder
+        hidden_size: number of channels in the hidden layer of the decoder
+        attention: whether to use attention in the decoder or not
+        """
         super(Decoder, self).__init__()
 
         self.layers = nn.ModuleList()
@@ -308,15 +360,18 @@ class Decoder(nn.Module):
                 "skip": nn.ModuleList([
                     nn.ModuleDict({
                         "upsample": Upsample(channels[j], channels[i], channels[j]//channels[i]),
+                         "attention": AttentionGate(channels[i], channels[i], hidden_size) # added attention gate here
                     })
                     for j in range(len(channels)-1, i, -1)
-                ]),
+                ]),                    
                 "concat": Concat(channels[i], len(channels)-1-i) if len(channels)-i > 1 else None,
                 #"self-attention": AttentionBlock(channels[i], num_heads[i], dropout),
                 "upsample": Upsample(channels[i], hidden_size, channels[i]//channels[0]),
+                "attention": AttentionGate(channels[i], channels[i], hidden_size) 
             }))
 
         self.concat = Concat(hidden_size, len(channels))
+        self.attention = attention # attention flag 
 
     def forward(self, skip):
         # add in residuals to each layer to see if this helps training or not
@@ -336,6 +391,9 @@ class Decoder(nn.Module):
 
                 y = residuals[j]
                 y = operations["upsample"](y)
+                # y = operations["attention"](y, skip[i])
+                
+                
                 upsampled_skip.append(y)
 
             x = skip[i]
@@ -344,7 +402,11 @@ class Decoder(nn.Module):
             if len(upsampled_skip) > 0:
                 tmp = layer["concat"](upsampled_skip)
                 # print(x.shape, tmp.shape)
-                x = x + tmp
+                
+                if self.attention:
+                    x = layer["attention"](tmp, x)  # dense attention  https://arxiv.org/pdf/2403.18180v1.pdf
+                else:
+                    x = x + tmp
 
             #x = layer["self-attention"](x, x, x)
             x = layer["upsample"](x)
@@ -352,6 +414,7 @@ class Decoder(nn.Module):
             layer_outputs.append(x)
 
         return self.concat(layer_outputs)
+
     
 class CustomModel(nn.Module):
     def __init__(
@@ -362,7 +425,8 @@ class CustomModel(nn.Module):
         num_heads: List[int],
         mlp_hidden: List[int],
         dropout: float,
-        decoder_hidden: int
+        decoder_hidden: int,
+        attention: bool = False
     ):
 
         super().__init__()
@@ -379,7 +443,7 @@ class CustomModel(nn.Module):
             channels=channels,
             hidden_size=decoder_hidden
         )
-
+    
         self.final_upsample = nn.UpsamplingBilinear2d(128)        
         self.classifier = nn.Sequential(
             MLPBlock(decoder_hidden, decoder_hidden*4),
@@ -397,3 +461,5 @@ class CustomModel(nn.Module):
         segmentation = self.classifier(upsampled_output)
 
         return self.activation(segmentation)
+    
+ 
