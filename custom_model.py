@@ -245,15 +245,15 @@ class Upsample(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, scale: int):
         super(Upsample, self).__init__()
 
-        self.up = nn.UpsamplingBilinear2d(scale_factor=scale)
+        # self.up = nn.UpsamplingBilinear2d(scale_factor=scale)
 
-        self.conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=1
-        )
+        # self.conv = nn.Conv2d(
+        #     in_channels=in_channels,
+        #     out_channels=out_channels,
+        #     kernel_size=1
+        # )
         
-        # self.convup = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=scale, stride=scale)
+        self.convup = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=scale, stride=scale)
         
 
         self.norm = Normalize(out_channels)
@@ -261,13 +261,13 @@ class Upsample(nn.Module):
     def forward(self, x):
         # x = (B, C, H, W)
 
-        x = self.up(x)
-        # x = (B, C, H*scale, W*scale)
+        # x = self.up(x)
+        # # x = (B, C, H*scale, W*scale)
 
-        x = self.conv(x)
-        # x = (B, C', H*scale, W*scale)
+        # x = self.conv(x)
+        # # x = (B, C', H*scale, W*scale)
         
-        # x=self.convup(x)
+        x=self.convup(x)
         
         x = self.norm(x)
 
@@ -307,7 +307,7 @@ class AttentionGate(nn.Module):
     def __init__(self, dim_g: int, dim_x: int, dim_int: int):
         """
         dim_x: number of channels in x, the input tensor from the skip connection
-        dim_g: number of channels in g, the tensor from the last layer of the decoder, which is resized to the same size as x
+        dim_g: number of channels in g, the tensor from previous skip connection, which is resized to the same size as x
         dim_int: number of channels in the intermediate tensor
         g provides gating signal to control the flow of information from x to decoder
         """
@@ -366,7 +366,7 @@ class Decoder(nn.Module):
                 ]),                    
                 "concat": Concat(channels[i], len(channels)-1-i) if len(channels)-i > 1 else None,
                 #"self-attention": AttentionBlock(channels[i], num_heads[i], dropout),
-                "upsample": Upsample(channels[i], hidden_size, channels[i]//channels[0]),
+                "upsample": Upsample(channels[i], hidden_size, 2 * channels[i]//channels[0]),
                 "attention": AttentionGate(channels[i], channels[i], hidden_size) 
             }))
 
@@ -388,10 +388,12 @@ class Decoder(nn.Module):
             upsampled_skip = []
             for j in range(0, len(residuals)):
                 operations = layer["skip"][j]
+               
 
                 y = residuals[j]
                 y = operations["upsample"](y)
-                # y = operations["attention"](y, skip[i])
+                if self.attention:
+                    y = operations["attention"](y, skip[i])  # dense attention  https://arxiv.org/pdf/2403.18180v1.pdf
                 
                 
                 upsampled_skip.append(y)
@@ -402,11 +404,7 @@ class Decoder(nn.Module):
             if len(upsampled_skip) > 0:
                 tmp = layer["concat"](upsampled_skip)
                 # print(x.shape, tmp.shape)
-                
-                if self.attention:
-                    x = layer["attention"](tmp, x)  # dense attention  https://arxiv.org/pdf/2403.18180v1.pdf
-                else:
-                    x = x + tmp
+                x = x + tmp
 
             #x = layer["self-attention"](x, x, x)
             x = layer["upsample"](x)
@@ -430,7 +428,6 @@ class CustomModel(nn.Module):
     ):
 
         super().__init__()
-        
         self.encoder = Encoder(
             channels=channels,
             scale=scale, 
@@ -439,9 +436,10 @@ class CustomModel(nn.Module):
             mlp_hidden=mlp_hidden,
             dropout=dropout)
         
-        self.decoder = Decoder(
+        self.decoder = Decoder( 
             channels=channels,
-            hidden_size=decoder_hidden
+            hidden_size=decoder_hidden,
+            attention=attention
         )
     
         self.final_upsample = nn.UpsamplingBilinear2d(128)        
