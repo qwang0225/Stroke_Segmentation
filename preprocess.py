@@ -23,6 +23,7 @@ from typing import List
 import requests
 import zipfile
 import pickle
+import ants
 
 
 def download_data(url: str, destination_path: str):
@@ -48,8 +49,13 @@ if not os.path.exists(zip_path):
 if not os.path.exists(data_dir):
     unzip(zip_path, '.\data')
 
-dwi_filepath_template = os.path.join(data_dir, "{filename}", "ses-0001", "dwi", "*dwi.nii.gz")
-seg_filepath_template = os.path.join(data_dir, "derivatives", "{filename}", "ses-0001", "*msk.nii.gz")
+# dwi_filepath_template = os.path.join(data_dir, "{filename}", "ses-0001", "dwi", "*dwi.nii.gz")
+# seg_filepath_template = os.path.join(data_dir, "derivatives", "{filename}", "ses-0001", "*msk.nii.gz")
+
+dwi_template = os.path.join(data_dir, "{filename}", "ses-0001", "dwi", "*dwi.nii.gz")
+adc_template = os.path.join(data_dir, "{filename}", "ses-0001", "dwi", "*adc.nii.gz")
+registered_flair_template = os.path.join(data_dir, "{filename}", "ses-0001", "anat", "*registered.nii.gz")
+mask_template = os.path.join(data_dir, "derivatives", "{filename}", "ses-0001", "*msk.nii.gz")
 target_size=(128, 128)
 
 
@@ -78,7 +84,11 @@ val_transforms = Compose(
 
 
 def load_image(filepath: str) -> FileBasedImage:
-    file = glob.glob(filepath)[0]
+    try:
+        file = glob.glob(filepath)[0]
+    except IndexError:
+        print(f"File {filepath} not found")
+        print(os.path.exists(file))
     return nib.load(file).get_fdata()
 
 def load_images(filenames: List[str], filepath_template: str) -> List[FileBasedImage]:
@@ -94,8 +104,10 @@ def get_stroke_filenames():
     return [file.split(os.sep)[-1] for file in all_files]
 
 def load_dwi_images(filenames: List[str]):
-    filepath_template = os.path.join(data_dir, "{filename}", "ses-0001", "dwi", "*dwi.nii.gz")
-    dwi_3d_images = load_images(filenames, filepath_template)
+    """
+    Load dwi images and resize them to target size
+    """
+    dwi_3d_images = load_images(filenames, dwi_template)
     
     dwi_2d_images = []
     for dwi_3d_image in dwi_3d_images:
@@ -107,6 +119,73 @@ def load_dwi_images(filenames: List[str]):
             dwi_2d_images.append(dwi_2d_image_3channel)
 
     return dwi_2d_images
+
+
+def load_segmentation_images(filenames: List[str]):
+    """
+    Load segmentation images and resize them to target size
+    """
+    seg_3d_images = load_images(filenames, mask_template)
+    
+    seg_2d_images = []
+    for seg_3d_image in seg_3d_images:
+        seg_3d_image[seg_3d_image > 0] = 1
+
+        for j in range(0, seg_3d_image.shape[2]):
+            seg_2d_image = cv2.resize(seg_3d_image[:, :, j], dsize=target_size, interpolation=cv2.INTER_NEAREST)
+            seg_2d_image = np.expand_dims(seg_2d_image, axis=0)
+            seg_2d_images.append(seg_2d_image)
+
+    return seg_2d_images
+
+def register_image(fixed: str, moving: str, out: str):
+    """
+    Register two images using ANTs.
+    fixed: path to the fixed image
+    moving: path to the moving image
+    out: path to save the registered image
+    """
+    fixed_image = ants.image_read(fixed)
+    
+    moving_image = ants.image_read(moving)
+    transform = ants.registration(fixed_image, moving_image, 'Affine')
+
+    reg3t = ants.apply_transforms(fixed_image, moving_image, transform['fwdtransforms'][0])
+    ants.image_write(reg3t, out)
+
+def register_flair_images(filenames: List[str]):
+    """
+    Register flair images to dwi images using ANTs."""
+    flair_template = os.path.join(data_dir, "{filename}", "ses-0001", "anat", "*FLAIR.nii.gz")
+    dwi_template = os.path.join(data_dir, "{filename}", "ses-0001", "dwi", "*dwi.nii.gz")
+    
+    for filename in filenames:
+        dwi_img = glob.glob(dwi_template.format(filename=filename))[0]
+        flair_img = glob.glob(flair_template.format(filename=filename))[0]
+        registered_falir_img = flair_img.split(".nii.gz")[0] + "_registered.nii.gz"
+        register_image(dwi_img, flair_img, registered_falir_img)
+        
+def load_full_images(filenames: List[str]):
+    """
+    load full 3-channel images with dwi, adc and flair
+    """
+    
+    dwi_3d_images = load_images(filenames, dwi_template)
+    adc_3d_images = load_images(filenames, adc_template)
+    flair_3d_images = load_images(filenames, registered_flair_template)
+    
+    full_2d_images = []
+    for dwi_3d_image, adc_3d_image, flair_3d_image in zip(dwi_3d_images, adc_3d_images, flair_3d_images):
+        for j in range(0, dwi_3d_image.shape[2]):
+            dwi_2d_image = cv2.resize(dwi_3d_image[:, :, j], dsize=target_size, interpolation=cv2.INTER_LINEAR)
+            adc_2d_image = cv2.resize(adc_3d_image[:, :, j], dsize=target_size, interpolation=cv2.INTER_LINEAR)
+            flair_2d_image = cv2.resize(flair_3d_image[:, :, j], dsize=target_size, interpolation=cv2.INTER_LINEAR)
+            full_2d_image_3channel = cv2.merge([dwi_2d_image, adc_2d_image, flair_2d_image])
+            full_2d_image_3channel = np.moveaxis(full_2d_image_3channel, -1, 0)
+            full_2d_images.append(full_2d_image_3channel)
+
+    return full_2d_images
+
 
 def create_dataset(images, labels):
     data = []
@@ -120,57 +199,60 @@ def create_dataset(images, labels):
 
     random.shuffle(data)
     train = data[:int(0.8 * len(data))]
-    test = data[int(0.8 * len(data)):]
-    return train, test
+    val = data[int(0.8 * len(data)):int(0.9 * len(data))]
+    test = data[int(0.9 * len(data)):]
+    return train, val, test
 
-def load_segmentation_images(filenames):
-    filepath_template = os.path.join(data_dir, "derivatives", "{filename}", "ses-0001", "*msk.nii.gz")
-    seg_3d_images = load_images(filenames, filepath_template)
-    
-    seg_2d_images = []
-    for seg_3d_image in seg_3d_images:
-        seg_3d_image[seg_3d_image > 0] = 1
+# def kfold_split(dataset):
+#     # Number of folds for cross-validation
+#     num_CV = 5
+#     kf = KFold(n_splits=num_CV, shuffle=True, random_state=42)
 
-        for j in range(0, seg_3d_image.shape[2]):
-            seg_2d_image = cv2.resize(seg_3d_image[:, :, j], dsize=target_size, interpolation=cv2.INTER_NEAREST)
-            seg_2d_image = np.expand_dims(seg_2d_image, axis=0)
-            seg_2d_images.append(seg_2d_image)
+#     # Lists to store training and validation sets for each fold
+#     folds = []
 
-    return seg_2d_images
+#     # Loop through the folds
+#     for train_index, val_index in kf.split(dataset):
 
-def kfold_split(dataset):
-    # Number of folds for cross-validation
-    num_CV = 5
-    kf = KFold(n_splits=num_CV, shuffle=True, random_state=42)
+#         train_data = [dataset[idx] for idx in train_index]
+#         val_data = [dataset[i] for i in val_index]
 
-    # Lists to store training and validation sets for each fold
-    folds = []
+#         # Append the training and validation sets to the lists
+#         folds.append({
+#             "train": Dataset(data=train_data, transform=train_transforms),
+#             "val": Dataset(data=val_data, transform=val_transforms)
+#         })
 
-    # Loop through the folds
-    for train_index, val_index in kf.split(dataset):
+#     return folds
 
-        train_data = [dataset[idx] for idx in train_index]
-        val_data = [dataset[i] for i in val_index]
-
-        # Append the training and validation sets to the lists
-        folds.append({
-            "train": Dataset(data=train_data, transform=train_transforms),
-            "val": Dataset(data=val_data, transform=val_transforms)
-        })
-
-    return folds
-
-
+# set random seed
+include_flair_adc = True 
+random.seed(42) 
 filenames = get_stroke_filenames()
-dwi_2d_images = load_dwi_images(filenames)
+
+if include_flair_adc:
+    # register_flair_images(filenames)
+    input_2d_images = load_full_images(filenames)
+else:
+    input_2d_images = load_dwi_images(filenames)
+
 seg_2d_images = load_segmentation_images(filenames)
-train, test = create_dataset(dwi_2d_images, seg_2d_images)
-folds = kfold_split(train) 
+train, val, test = create_dataset(input_2d_images, seg_2d_images)
+train_set = {'train': Dataset(data=train, transform=train_transforms), 'val': Dataset(data=val, transform=val_transforms)}
 test_set = Dataset(data=test, transform=val_transforms)
 
+with open('three_sequence_train_set.pkl', 'wb') as f:
+    pickle.dump(train_set, f)
+with open('three_sequence_test_set.pkl', 'wb') as f:
+    pickle.dump(test_set, f)
 
-# with open('kfold_splits.pkl', 'wb') as f:
+
+# folds = kfold_split(train)
+# print(2)
+
+# with open('full_kfold_splits.pkl', 'wb') as f:
 #     pickle.dump(folds, f)
     
-# with open('test_set.pkl', 'wb') as f:
+# with open('full_test_set.pkl', 'wb') as f:
 #     pickle.dump(test_set, f)
+    
